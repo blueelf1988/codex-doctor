@@ -65,7 +65,32 @@ GROUP BY provider_id, status_code;
 ```
 
 - 4xx（401/400/404）→ 配置或模型名问题 → 能修
-- 429（额度用完）→ **服务商限额** → 换路由或等重置，脚本无解
+- 429（额度用完 / All available accounts rate-limited）→ **服务商限额** → 换路由或等重置，脚本无解
 - 500 + "Token Plan 上限" → 服务商套餐耗尽 → 同上
-- 503 "No available channel" → 上游分组没有该模型 → 对齐模型名 + ⌘Q 重启客户端
+- 503 "No available channel for model xxx" → 上游分组没有该模型 → 对齐模型名 + ⌘Q 重启客户端
+- 502 + "Broken pipe / connection closed / dns error" → **网络层**，不是配置
+- 504 + "Connect: operation timed out" → TCP 建连超时 → 链路质量问题
 - 200 但客户端仍重连 → 链路慢 → 调大 `stream_idle_timeout_ms`
+
+### 延迟画像（判断"慢"还是"断"）
+
+```sql
+SELECT first_token_ms, latency_ms, model, status_code
+FROM proxy_request_logs WHERE provider_id=? ORDER BY rowid DESC LIMIT 60;
+```
+
+- **首 token 中位 > 10s** → 客户端必然 idle timeout 重连（改超时参数 + 换模型）
+- **同机对照**：拿另一个端点跑同一个 `curl -w`（TLS/首字节/总耗时）。若别的端点亚秒级、只有这一条慢 → **是这条线路的问题，不是你的网络出口**
+
+### 错误根因归并（避免被表面状态码误导）
+
+502 里混着三类根因，必须拆开看 error_message 原文：
+`dns error` / `failed to lookup` → DNS；`operation timed out` → 建连超时；`Broken pipe` / `connection closed` → 传输中断。
+
+### 上游模型清单（别猜）
+
+判定"模型名对不对"的权威来源是**直接拉上游 `/v1/models`**（带上该 provider 的 key），而不是 CC Switch 里配的列表——两者经常不一致（CC Switch 里手动加的映射可能上游早就没有通道）。
+
+### 必须走代理层判定服务商状态
+
+直连 curl 打上游会拿到**误导性的前置错误**（例：OpenCode Go 直连返回 `400 MissingSessionID`，掩盖了真实的 `402 余额不足`——`x-opencode-session` 头由 CC Switch 注入）。**判定额度/可用性必须看 `proxy_request_logs` 的 error_message 全文。**

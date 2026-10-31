@@ -53,6 +53,16 @@ LAUNCH_AGENT = os.path.join(
 
 NO_PROXY_VALUES = "127.0.0.1,localhost,::1"
 
+# proxy 模式下 Codex 必须把请求发给 CC Switch 的本地代理，
+# 由代理层再按 live-state 的 proxy_route 转发到真实上游。
+# 直接写上游地址会绕过代理层：CC Switch 界面切路由对 Codex 失效，
+# 代理日志（proxy_request_logs）也记不到，排查时两眼一抹黑。
+PROXY_BASE_URL = "http://127.0.0.1:15721/v1"
+PROXY_BEARER = "PROXY_MANAGED"
+
+# Codex 的模型目录文件（CC Switch 生成，Codex 启动时读它拿模型元数据）
+CATALOG_FILE = os.path.join(CODEX_HOME, "cc-switch-model-catalog.json")
+
 # 链路慢时的"耐心值"：Codex 默认的流式空闲超时太短，
 # 中转商 TLS 握手 4–15 秒 + 首字节 11–17 秒时，客户端会误判为断线
 # （idle timeout waiting for SSE）然后反复重连。
@@ -244,6 +254,65 @@ def _provider_custom_segment(provider_id):
         return None
 
 
+def _provider_model_catalog(provider_id):
+    """只读：取当前路由供应商在 CC Switch 里登记的模型清单"""
+    if not provider_id or not os.path.exists(CC_DB):
+        return []
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % CC_DB, uri=True, timeout=10)
+        row = con.execute(
+            "SELECT settings_config FROM providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        con.close()
+        if not row:
+            return []
+        cat = (json.loads(row[0]) or {}).get("modelCatalog") or {}
+        return cat.get("models") or []
+    except Exception:
+        return []
+
+
+def _catalog_entry(base, spec):
+    """按供应商登记的模型信息，生成一条 Codex 模型目录条目。
+
+       关键：tool_mode 必须改成 direct —— 抄别的模型的条目时会连
+       code_mode_only 一起抄过来，Codex 就会发 'exec' 自定义工具，
+       而只认 apply_patch 的上游会直接 400。
+    """
+    slug = spec.get("model")
+    if not slug:
+        return None
+    m = json.loads(json.dumps(base))  # 深拷贝
+    ctx = spec.get("contextWindow") or base.get("context_window") or 272000
+    mods = spec.get("inputModalities") or ["text"]
+    levels = spec.get("reasoningLevels") or ["low", "high", "max"]
+    descs = {"low": "Fast responses with lighter reasoning",
+             "medium": "Balanced reasoning",
+             "high": "Solid reasoning",
+             "xhigh": "Deeper reasoning",
+             "max": "Deepest reasoning"}
+    m["slug"] = slug
+    m["display_name"] = spec.get("displayName") or slug
+    m["context_window"] = ctx
+    m["max_context_window"] = ctx
+    m["auto_compact_token_limit"] = int(ctx * 0.9)
+    m["effective_context_window_percent"] = 95
+    m["input_modalities"] = mods
+    m["supports_image_detail_original"] = "image" in mods
+    m["supported_reasoning_levels"] = [
+        {"description": descs.get(lv, "Reasoning effort %s" % lv), "effort": lv}
+        for lv in levels
+    ]
+    m["default_reasoning_level"] = spec.get("defaultReasoningLevel") or "high"
+    m["multi_agent_reasoning_effort"] = "max"
+    m["tool_mode"] = "direct"
+    m["apply_patch_tool_type"] = "freeform"
+    m["experimental_supported_tools"] = []
+    m["description"] = spec.get("description") or ("%s via CC Switch route" % slug)
+    m["comp_hash"] = str(abs(hash(slug)) % 9000 + 1000)
+    return m
+
+
 # ================================================================ doctor
 
 def doctor(verbose=True):
@@ -311,6 +380,21 @@ def doctor(verbose=True):
                                "供应商小节里没写「等待耐心值」（%s）——"
                                "中转商握手慢时（4–15 秒），Codex 会误判成断线，"
                                "然后反复重连到失败" % "、".join(missing), "fix"))
+            # base_url 必须指向本地代理，否则等于绕过了 CC Switch
+            bm = re.search(r'^[ \t]*base_url[ \t]*=[ \t]*"([^"]*)"', seg, re.M)
+            if bm and bm.group(1).rstrip("/") != PROXY_BASE_URL.rstrip("/"):
+                ISSUES.append(("proxy-base-url-bypass",
+                               "供应商小节里的 base_url 写的是上游直连地址（%s），"
+                               "不是 CC Switch 本地代理（%s）——这样 Codex 绕过了代理层，"
+                               "界面里切路由对它无效，代理日志也记不到，"
+                               "出问题无从查起" % (bm.group(1), PROXY_BASE_URL), "fix"))
+            tm = re.search(r'^[ \t]*experimental_bearer_token[ \t]*=[ \t]*"([^"]*)"', seg, re.M)
+            if tm and tm.group(1) != PROXY_BEARER:
+                ISSUES.append(("real-key-in-proxy-config",
+                               "供应商小节里写着真实 API Key（%s…）——"
+                               "打本地代理不需要它，真 key 留在菜单里等于泄露面扩大，"
+                               "应换成代理占位凭证（%s）"
+                               % (tm.group(1)[:8], PROXY_BEARER), "fix"))
 
         if mode == "direct" and has_mp:
             ISSUES.append(("direct-mp-residue",
@@ -329,6 +413,36 @@ def doctor(verbose=True):
             ISSUES.append(("model-mismatch",
                            "菜单上写的模型（%s）和你当前路由的模型（%s）不是同一个，"
                            "上游会报 unknown model" % (cur.group(1), want), "fix"))
+
+    # ---- 检查模型目录（Codex 读它拿模型元数据）----
+    route = current_route()
+    if mode == "proxy" and route and os.path.exists(CATALOG_FILE):
+        specs = _provider_model_catalog(route)
+        if specs:
+            try:
+                with open(CATALOG_FILE, encoding="utf-8") as f:
+                    cat = json.load(f)
+                cmodels = cat.get("models") or []
+                byslug = {m.get("slug"): m for m in cmodels}
+                missing = [s.get("model") for s in specs
+                           if s.get("model") and s.get("model") not in byslug]
+                if missing:
+                    ISSUES.append(("catalog-model-missing",
+                                   "模型目录里没有当前路由的模型（%s）——"
+                                   "Codex 会退回兜底元数据，"
+                                   "1M 上下文被当成默认值，能力被砍"
+                                   % "、".join(missing), "fix"))
+                badtool = [s.get("model") for s in specs
+                           if s.get("model") in byslug
+                           and byslug[s.get("model")].get("tool_mode") == "code_mode_only"]
+                if badtool:
+                    ISSUES.append(("catalog-tool-mode",
+                                   "模型目录里 %s 用了 code_mode_only——"
+                                   "Codex 会发 'exec' 自定义工具，"
+                                   "只认 apply_patch 的上游直接 400"
+                                   % "、".join(badtool), "fix"))
+            except Exception:
+                pass
 
     # ---- 检查 .env ----
     if os.path.exists(ENV_FILE):
@@ -389,6 +503,77 @@ def doctor(verbose=True):
         say("")
         say("=" * 62)
     return len(ISSUES) == 0
+
+
+# ================================================================ fix
+
+def fix_catalog():
+    """修 Codex 的模型目录文件。
+
+       两件事：
+       1) 当前路由供应商登记的模型，必须在目录里有条目——否则 Codex 报
+          "Model metadata not found" 用兜底元数据，1M 上下文被当成默认值。
+       2) 条目里的 tool_mode 必须是 direct——code_mode_only 会让 Codex
+          发 'exec' 自定义工具，只认 apply_patch 的上游直接 400。
+    """
+    route = current_route()
+    if not route:
+        return
+    specs = _provider_model_catalog(route)
+    if not specs:
+        return
+    if not os.path.exists(CATALOG_FILE):
+        return
+    try:
+        with open(CATALOG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    models = data.get("models") or []
+    if not models:
+        return
+    base = models[0]
+    have = {m.get("slug") for m in models}
+    added, fixed = [], []
+    for spec in specs:
+        slug = spec.get("model")
+        if not slug:
+            continue
+        if slug in have:
+            # 已存在：检查工具模式
+            for m in models:
+                if m.get("slug") != slug:
+                    continue
+                if m.get("tool_mode") == "code_mode_only":
+                    m["tool_mode"] = "direct"
+                    m["apply_patch_tool_type"] = "freeform"
+                    m["experimental_supported_tools"] = []
+                    fixed.append(slug)
+                break
+            continue
+        entry = _catalog_entry(base, spec)
+        if entry:
+            models.append(entry)
+            added.append(slug)
+    if not added and not fixed:
+        return
+    data["models"] = models
+    try:
+        bak = backup(CATALOG_FILE)
+        if bak:
+            FIX_LOG.append("已备份模型目录 → %s" % os.path.basename(bak))
+        with open(CATALOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        if added:
+            FIX_LOG.append("模型目录补进当前路由的模型（%s）——"
+                           "缺条目时 Codex 只能用兜底元数据，"
+                           "1M 上下文会被当成默认值" % "、".join(added))
+        if fixed:
+            FIX_LOG.append("模型目录里 %s 的工具模式从 code_mode_only 改回 direct"
+                           "（code 模式会让 Codex 发 exec 工具，上游不认）"
+                           % "、".join(fixed))
+    except Exception as e:
+        say("  ⚠ 模型目录暂时没写进去（不影响能不能连）：%s" % e)
 
 
 # ================================================================ fix
@@ -470,6 +655,38 @@ def fix():
                                    "已按当前路由的供应商配置补建（照搬，不编造），"
                                    "并补齐：%s" % "、".join(added))
 
+            # 1c-2. base_url 必须指向 CC Switch 本地代理
+            # 直写上游地址 = 绕过代理层，界面切路由对 Codex 失效
+            span = _segment_span(src, "model_providers.custom")
+            if span:
+                s, e = span
+                seg = src[s:e]
+                m = re.search(r'^[ \t]*base_url[ \t]*=[ \t]*"([^"]*)"', seg, re.M)
+                if not m:
+                    seg = seg.rstrip("\n") + '\nbase_url = "%s"\n' % PROXY_BASE_URL
+                    src = src[:s] + seg + src[e:]
+                    FIX_LOG.append("供应商小节里没有 base_url——已补成 CC Switch 本地代理"
+                                   "（%s）" % PROXY_BASE_URL)
+                elif m.group(1).rstrip("/") != PROXY_BASE_URL.rstrip("/"):
+                    old_url = m.group(1)
+                    seg = seg[:m.start(1)] + PROXY_BASE_URL + seg[m.end(1):]
+                    src = src[:s] + seg + src[e:]
+                    FIX_LOG.append("base_url 从上游直连地址（%s）改成本地代理（%s）——"
+                                   "绕过了代理层，界面切路由会对 Codex 失效"
+                                   % (old_url, PROXY_BASE_URL))
+                # 本地代理用占位凭证，真实 key 由代理层按 provider 注入
+                bm2 = re.search(r'^[ \t]*experimental_bearer_token[ \t]*=[ \t]*"([^"]*)"', seg, re.M)
+                if not bm2:
+                    seg = seg.rstrip("\n") + '\nexperimental_bearer_token = "%s"\n' % PROXY_BEARER
+                    src = src[:s] + seg + src[e:]
+                    FIX_LOG.append("补上代理占位凭证（experimental_bearer_token）")
+                elif bm2.group(1) != PROXY_BEARER:
+                    seg = seg[:bm2.start(1)] + PROXY_BEARER + seg[bm2.end(1):]
+                    src = src[:s] + seg + src[e:]
+                    FIX_LOG.append("把真实 API Key 换成代理占位凭证（%s）——"
+                                   "本地代理不校验它，真 key 该由代理层按供应商注入"
+                                   % PROXY_BEARER)
+
             # 1d. 菜单上的模型名对齐当前路由
             want = _provider_model(current_route())
             cur = re.search(r'^\s*model\s*=\s*"([^"]+)"', src, re.M)
@@ -548,6 +765,9 @@ def fix():
 
     # ---------- 3.5 路由切换检测（会话粘性提醒）----------
     check_mode_switch()
+
+    # ---------- 4. 模型目录（Codex 读它拿模型元数据）----------
+    fix_catalog()
 
     # ---------- 汇总 ----------
     if FIX_LOG:
