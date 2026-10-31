@@ -15,6 +15,8 @@ codex_guard.py — Codex × CC Switch 连不上？一条命令治好它。
     3. 401「已切换到 OpenAI 官方供应商，但这个请求仍按第三方供应商的配置发出」
     4. 「unknown model 'xxx'」
     5. 升级客户端 / 切换路由后突然连不上
+    6. 「无法连接 / error sending request for url」——中转商掐断 keep-alive 连接
+       导致 CC Switch 连接池里攒下坏连接，越用越死
 
 原理一句话：
     你的 Codex 读 ~/.codex/config.toml 这个"菜单"来决定连谁。
@@ -281,6 +283,87 @@ def _provider_upstream_host(provider_id):
         return None
 
 
+def _cc_recent_failures(provider_id, window_sec=180):
+    """只读：看这个供应商最近 window_sec 秒内的连续失败次数"""
+    if not provider_id or not os.path.exists(CC_DB):
+        return 0, 0
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % CC_DB, uri=True, timeout=10)
+        now = int(time.time())
+        rows = con.execute(
+            "SELECT status_code FROM proxy_request_logs "
+            "WHERE provider_id=? AND created_at > ? ORDER BY created_at DESC",
+            (provider_id, now - window_sec)).fetchall()
+        con.close()
+        fails = 0
+        for (sc,) in rows:
+            if sc == 200:
+                break
+            fails += 1
+        return fails, len(rows)
+    except Exception:
+        return 0, 0
+
+
+def _restart_cc_switch():
+    """重启 CC Switch —— 清空它攒下的坏连接池"""
+    pid = None
+    try:
+        r = subprocess.run(["lsof", "-nP", "-iTCP:15721", "-sTCP:LISTEN"],
+                           capture_output=True, text=True, timeout=15)
+        for line in (r.stdout or "").splitlines()[1:]:
+            parts = line.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                pid = int(parts[1])
+                break
+    except Exception:
+        pid = None
+    if not pid:
+        return False
+    try:
+        subprocess.run(["kill", str(pid)], capture_output=True, timeout=15)
+        time.sleep(5)
+        subprocess.run(["open", "-a", "CC Switch"], capture_output=True, timeout=20)
+        time.sleep(8)
+        return True
+    except Exception:
+        return False
+
+
+def fix_connection_pool():
+    """治「连接池里攒了坏连接」。
+
+       实测：中转商会静默掐断空闲的 keep-alive 连接（不发 FIN/RST），
+       客户端连接池里那条连接就成了「僵尸」——下次复用直接报
+       connection closed via error / handshake timed out。
+       CC Switch 复用连接，于是越用越死（实测连败 88 次）。
+       解法只有一个：重启 CC Switch 让它丢掉这些连接。
+    """
+    route = current_route()
+    if not route:
+        return
+    fails, total = _cc_recent_failures(route)
+    if total < 5 or fails < 5:
+        return
+    # 连续失败但又夹杂成功 → 不是池子坏了，是链路抖（重试能救）
+    if fails < total:
+        return
+    # 熔断计数也一起清掉
+    try:
+        con = sqlite3.connect(CC_DB, timeout=20)
+        cur = con.cursor()
+        cur.execute("UPDATE provider_health SET consecutive_failures=0, "
+                    "is_healthy=1, last_error=NULL "
+                    "WHERE provider_id=? AND app_type='codex'", (route,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+    if _restart_cc_switch():
+        FIX_LOG.append("连续 %d 次连接失败——重启了 CC Switch 清掉坏连接池，"
+                       "并重置了熔断计数（中转商掐断 keep-alive 连接所致）" % fails)
+
+
 def _system_bypass_has(domain):
     """查 macOS 系统代理的绕过列表里有没有这个域名"""
     try:
@@ -486,8 +569,18 @@ def doctor(verbose=True):
                            "菜单上写的模型（%s）和你当前路由的模型（%s）不是同一个，"
                            "上游会报 unknown model" % (cur.group(1), want), "fix"))
 
-    # ---- 检查模型目录（Codex 读它拿模型元数据）----
+    # ---- 检查连接池坏连接（中转商掐断 keep-alive 所致）----
     route = current_route()
+    if mode == "proxy" and route:
+        fails, total = _cc_recent_failures(route)
+        if total >= 5 and fails >= 5 and fails == total:
+            ISSUES.append(("stale-connection-pool",
+                           "当前线路连续 %d 次连接失败（全是 connection closed / "
+                           "handshake timed out）——中转商把空闲的 keep-alive 连接"
+                           "悄悄掐断了，CC Switch 连接池里攒下坏连接，越用越死。"
+                           "重启 CC Switch 可清掉" % fails, "fix"))
+
+    # ---- 检查模型目录（Codex 读它拿模型元数据）----
     if mode == "proxy" and route and os.path.exists(CATALOG_FILE):
         specs = _provider_model_catalog(route)
         if specs:
@@ -843,6 +936,8 @@ def fix():
             out = [l for l in out if not re.match(r'^no_proxy\s*=', l.strip(), re.I)]
             out += fixed_np
         new = "\n".join(out).rstrip("\n") + "\n"
+        new = re.sub(r"\n{3,}", "\n\n", new)
+        new = new.lstrip("\n")
         old = "\n".join(lines).rstrip("\n") + "\n"
         if new != old:
             with open(ENV_FILE, "w", encoding="utf-8") as f:
@@ -908,6 +1003,9 @@ def fix():
 
     # ---------- 4. 模型目录（Codex 读它拿模型元数据）----------
     fix_catalog()
+
+    # ---------- 5. 连接池坏连接（连续失败时重启 CCS）----------
+    fix_connection_pool()
 
     # ---------- 汇总 ----------
     if FIX_LOG:
