@@ -51,7 +51,15 @@ LOG = os.path.join(GUARD_DIR, "guard.log")
 LAUNCH_AGENT = os.path.join(
     HOME, "Library", "LaunchAgents", "com.leozhang.codex-rootfix.plist")
 
-NO_PROXY_VALUES = "127.0.0.1,localhost,::1"
+NO_PROXY_VALUES = "127.0.0.1,localhost,::1,api.888aix.cn,.888aix.cn"
+
+# 中转商域名必须绕过系统代理。
+# 实测：本机系统代理指向 Clash（127.0.0.1:4780），而 api.888aix.cn 解析到
+# Cloudflare Anycast IP，不命中 GEOIP,CN，落到 Clash 规则的 MATCH,Others →
+# Proxy 组（境外节点），实测走代理 TLS 直接失败（0/3），直连却能通（3/4）。
+# Clash 配置更新后绕过规则可能被冲掉，所以这里做成守护的固定职责。
+MUST_BYPASS_DOMAINS = ["api.888aix.cn", ".888aix.cn"]
+
 
 # proxy 模式下 Codex 必须把请求发给 CC Switch 的本地代理，
 # 由代理层再按 live-state 的 proxy_route 转发到真实上游。
@@ -68,10 +76,10 @@ CATALOG_FILE = os.path.join(CODEX_HOME, "cc-switch-model-catalog.json")
 # （idle timeout waiting for SSE）然后反复重连。
 # 这些键属于 [model_providers.xxx] 段，Codex 官方支持。
 PROVIDER_TUNING = [
-    ("stream_idle_timeout_ms", "180000"),   # 流式空闲容忍 3 分钟
+    ("stream_idle_timeout_ms", "300000"),   # 流式空闲容忍 5 分钟（AIX 实测首字最久 8.4s，但流式更久）
     ("websocket_connect_timeout_ms", "30000"),
-    ("request_max_retries", "5"),
-    ("stream_max_retries", "5"),
+    ("request_max_retries", "8"),
+    ("stream_max_retries", "8"),
 ]
 
 # Codex 客户端可能的安装位置（升级会换地方）
@@ -185,15 +193,23 @@ def check_mode_switch():
 
 def _ensure_provider_keys(seg_text):
     """给供应商小节补齐：WebSocket 快线开关 + 链路慢时的耐心值。
-       只补缺失的，不覆盖已有配置。返回 (新段文本, 补了哪些)。"""
+       只补缺失的，不覆盖已有配置——但如果耐心值比建议值小，
+       慢链路下仍会被误判成断线，这种情况下要抬到建议值。
+       返回 (新段文本, 补了哪些)。"""
     added = []
     if not re.search(r"^\s*supports_websockets\s*=", seg_text, re.M):
         seg_text = seg_text.rstrip("\n") + "\nsupports_websockets = false\n"
         added.append("不走 WebSocket 快线")
     for key, val in PROVIDER_TUNING:
-        if not re.search(r"^\s*%s\s*=" % re.escape(key), seg_text, re.M):
+        m = re.search(r"^\s*%s\s*=\s*(\d+)" % re.escape(key), seg_text, re.M)
+        if not m:
             seg_text = seg_text.rstrip("\n") + "\n%s = %s\n" % (key, val)
             added.append("%s=%s" % (key, val))
+        elif int(m.group(1)) < int(val):
+            # 已有但偏小：抬到建议值（慢链路需要更多耐心）
+            seg_text = (seg_text[:m.start(1)] + val + seg_text[m.end(1):])
+            added.append("%s %s→%s（慢链路需要更多耐心）"
+                         % (key, m.group(1), val))
     return seg_text, added
 
 
@@ -232,6 +248,55 @@ def _provider_model(provider_id):
         return m.group(1) if m else None
     except Exception:
         return None
+
+
+def _provider_upstream_host(provider_id):
+    """只读：取当前路由供应商的上游域名（从 endpoint 或 base_url）"""
+    if not provider_id or not os.path.exists(CC_DB):
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % CC_DB, uri=True, timeout=10)
+        row = con.execute(
+            "SELECT url FROM provider_endpoints WHERE provider_id=? "
+            "ORDER BY id LIMIT 1", (provider_id,)
+        ).fetchone()
+        if not row:
+            row2 = con.execute(
+                "SELECT settings_config FROM providers WHERE id=?",
+                (provider_id,)).fetchone()
+            con.close()
+            if not row2:
+                return None
+            cfg = (json.loads(row2[0]) or {}).get("config", "") or ""
+            m = re.search(r'^[ \t]*base_url[ \t]*=[ \t]*"([^"]+)"', cfg, re.M)
+            url = m.group(1) if m else ""
+        else:
+            con.close()
+            url = row[0] or ""
+        if not url:
+            return None
+        m = re.match(r"https?://([^/:]+)", url.strip())
+        return m.group(1).lower() if m else None
+    except Exception:
+        return None
+
+
+def _system_bypass_has(domain):
+    """查 macOS 系统代理的绕过列表里有没有这个域名"""
+    try:
+        r = subprocess.run(["networksetup", "-getproxybypassdomains", "Wi-Fi"],
+                           capture_output=True, text=True, timeout=15)
+        txt = (r.stdout or "") + (r.stderr or "")
+        dom = domain.lower()
+        for line in txt.splitlines():
+            v = line.strip().lower()
+            if not v:
+                continue
+            if v == dom or v == "*." + dom or dom.endswith(v.lstrip("*.")):
+                return True
+        return False
+    except Exception:
+        return True   # 查不到就不误报
 
 
 def _provider_custom_segment(provider_id):
@@ -373,13 +438,20 @@ def doctor(verbose=True):
                 ISSUES.append(("custom-seg-missing",
                                "菜单里缺少 [model_providers.custom] 小节", "fix"))
             # 链路慢时的耐心值：没有它，Codex 会把"上游慢"误判成"断了"
-            missing = [k for k, _ in PROVIDER_TUNING
-                       if not re.search(r"^\s*%s\s*=" % re.escape(k), seg, re.M)]
-            if missing:
+            # 太小的同样不行——AIX 首字节实测就要 2–8 秒
+            too_small = []
+            for k, v in PROVIDER_TUNING:
+                mv = re.search(r"^\s*%s\s*=\s*(\d+)" % re.escape(k), seg, re.M)
+                if not mv:
+                    too_small.append("%s（缺）" % k)
+                elif int(mv.group(1)) < int(v):
+                    too_small.append("%s=%s（建议≥%s）" % (k, mv.group(1), v))
+            if too_small:
                 ISSUES.append(("timeout-tuning-missing",
-                               "供应商小节里没写「等待耐心值」（%s）——"
-                               "中转商握手慢时（4–15 秒），Codex 会误判成断线，"
-                               "然后反复重连到失败" % "、".join(missing), "fix"))
+                               "供应商小节里的「等待耐心值」不够（%s）——"
+                               "中转商握手慢时（首字节 2–8 秒），"
+                               "Codex 会误判成断线，然后反复重连到失败"
+                               % "、".join(too_small), "fix"))
             # base_url 必须指向本地代理，否则等于绕过了 CC Switch
             bm = re.search(r'^[ \t]*base_url[ \t]*=[ \t]*"([^"]*)"', seg, re.M)
             if bm and bm.group(1).rstrip("/") != PROXY_BASE_URL.rstrip("/"):
@@ -457,6 +529,31 @@ def doctor(verbose=True):
             ISSUES.append(("no-proxy-missing",
                            "「快递单」上没有写「本地地址不用走代理」的白名单，"
                            "发往本机代理的请求可能被半路劫走", "fix"))
+        else:
+            np_missing = [d for d in MUST_BYPASS_DOMAINS
+                          if d not in env]
+            if np_missing:
+                ISSUES.append(("aix-not-bypassed",
+                               "「快递单」的 no_proxy 里没有 %s——"
+                               "走系统代理(Clash)时它会落到 MATCH,Others→Proxy 组走境外节点，"
+                               "实测 TLS 直接握手失败（直连却通），"
+                               "表现就是「连不上/一直重连」"
+                               % "、".join(np_missing), "fix"))
+
+    # ---- 检查系统代理绕过列表（macOS 层面）----
+    if mode == "proxy" and route:
+        try:
+            upstream = _provider_upstream_host(route)
+        except Exception:
+            upstream = None
+        if upstream and upstream.endswith("888aix.cn"):
+            bypass_ok = _system_bypass_has(upstream)
+            if not bypass_ok:
+                ISSUES.append(("system-proxy-bypass-missing",
+                               "macOS 系统代理的绕过列表里没有 %s——"
+                               "Clash 会把它判给境外节点，实测走代理 TLS 握手失败、"
+                               "直连却通，表现成「无法连接」"
+                               % upstream, "fix"))
 
     # ---- 检查 CC Switch 数据库（配置模板库）----
     if os.path.exists(CC_DB):
@@ -720,9 +817,31 @@ def fix():
                 removed.append(ln.split("=")[0].strip())
                 continue
             out.append(ln)
-        if not any(re.match(r'^no_proxy\s*=', l.strip(), re.I) for l in out):
+        # no_proxy 必须包含 AIX 域名 —— 走系统代理(Clash)时 AIX 的
+        # Cloudflare Anycast IP 不命中 GEOIP,CN，会落到 MATCH,Others→Proxy
+        # 组走境外节点，实测走代理 TLS 直接失败、直连却通。
+        np_lines = [l for l in out if re.match(r'^no_proxy\s*=', l.strip(), re.I)]
+        if not np_lines:
             out.append('NO_PROXY="%s"' % NO_PROXY_VALUES)
             out.append('no_proxy="%s"' % NO_PROXY_VALUES)
+            FIX_LOG.append("快递单补上「本地地址与中转商不走代理」白名单")
+        else:
+            fixed_np = []
+            for l in np_lines:
+                vals = re.findall(r'["\']([^"\']*)["\']', l)
+                cur_vals = [v for part in vals for v in part.split(",") if v.strip()]
+                missing = [d for d in MUST_BYPASS_DOMAINS if d not in cur_vals]
+                if missing:
+                    cur_vals += missing
+                    newline = l.split("=")[0] + "=" + '"%s"' % ",".join(cur_vals)
+                    fixed_np.append(newline)
+                    FIX_LOG.append("快递单的 no_proxy 补上 %s——"
+                                   "走系统代理(Clash)时这条线路连不上"
+                                   % "、".join(missing))
+                else:
+                    fixed_np.append(l)
+            out = [l for l in out if not re.match(r'^no_proxy\s*=', l.strip(), re.I)]
+            out += fixed_np
         new = "\n".join(out).rstrip("\n") + "\n"
         old = "\n".join(lines).rstrip("\n") + "\n"
         if new != old:
@@ -731,7 +850,28 @@ def fix():
             if removed:
                 FIX_LOG.append("撕掉快递单上关门代理的地址（%s）——"
                                 "这是无限重连的真凶" % ", ".join(removed))
-            FIX_LOG.append("快递单补上「本地地址不走代理」白名单")
+
+    # ---------- 2.5 macOS 系统代理绕过列表 ----------
+    # Clash 更新配置后可能把绕过规则冲掉，AIX 就又走境外节点连不上了。
+    try:
+        upstream = _provider_upstream_host(current_route())
+    except Exception:
+        upstream = None
+    if upstream and upstream.endswith("888aix.cn") and not _system_bypass_has(upstream):
+        try:
+            r = subprocess.run(["networksetup", "-getproxybypassdomains", "Wi-Fi"],
+                               capture_output=True, text=True, timeout=15)
+            cur = [l.strip() for l in (r.stdout or "").splitlines() if l.strip()]
+            for d in MUST_BYPASS_DOMAINS:
+                if d not in cur:
+                    cur.append(d)
+            subprocess.run(["networksetup", "-setproxybypassdomains", "Wi-Fi"] + cur,
+                           capture_output=True, text=True, timeout=20)
+            FIX_LOG.append("macOS 系统代理绕过列表补上 %s——"
+                           "不走代理这条线才连得上"
+                           % "、".join(MUST_BYPASS_DOMAINS))
+        except Exception as e:
+            say("  ⚠ 系统代理绕过列表暂时改不了（不影响 Codex 走本地代理）：%s" % e)
 
     # ---------- 3. CC Switch 模板库（治本）----------
     if os.path.exists(CC_DB):
