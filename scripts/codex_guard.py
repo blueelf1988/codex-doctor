@@ -73,6 +73,28 @@ PROXY_BEARER = "PROXY_MANAGED"
 # Codex 的模型目录文件（CC Switch 生成，Codex 启动时读它拿模型元数据）
 CATALOG_FILE = os.path.join(CODEX_HOME, "cc-switch-model-catalog.json")
 
+# Clash（海豚湾）的配置文件：订阅更新会重生成，手工加的规则会被冲掉
+CLASH_CONFIG = os.path.join(
+    HOME, "Library", "Application Support", "rok-e8ea5596",
+    "clash-configs", "rocket.yaml")
+
+# Clash 内核的外部控制器地址。
+# ⚠️ 端口不是固定的：本机实测 rocket.yaml 里写的是 0.0.0.0:9090（secret=hitun），
+# 但运行中的内核实际监听 4788（secret 为空）——它加载的是订阅合并后的另一份配置。
+# 所以这里做多端口探测，不写死。
+CLASH_CONTROLLERS = [
+    ("127.0.0.1", 4788, ""),
+    ("127.0.0.1", 9090, "hitun"),
+    ("127.0.0.1", 9090, ""),
+    ("127.0.0.1", 4788, "hitun"),
+]
+
+# 上游（Cloudflare 后面）要求请求带真实 User-Agent。
+# 实测：不带 UA 时上游返回 403「used Cloudflare to restrict access」
+# （CF 规则 1010 浏览器完整性检查），带 codex_cli_rs 的 UA 后同样请求 HTTP 200。
+# 这个 UA 写在 CCS 数据库的 provider meta.customUserAgent 里。
+CODEX_UA = "codex_cli_rs/0.166.0-alpha.5.1"
+
 # 链路慢时的"耐心值"：Codex 默认的流式空闲超时太短，
 # 中转商 TLS 握手 4–15 秒 + 首字节 11–17 秒时，客户端会误判为断线
 # （idle timeout waiting for SSE）然后反复重连。
@@ -80,6 +102,18 @@ CATALOG_FILE = os.path.join(CODEX_HOME, "cc-switch-model-catalog.json")
 PROVIDER_TUNING = [
     ("stream_idle_timeout_ms", "300000"),   # 流式空闲容忍 5 分钟（AIX 实测首字最久 8.4s，但流式更久）
     ("websocket_connect_timeout_ms", "30000"),
+    ("request_max_retries", "8"),
+    ("stream_max_retries", "8"),
+]
+
+# 只在数据库模板里写、但不强求 config.toml 里有的键。
+# 实测：CC Switch 接管重写 config.toml 时用的是它自己的字段集，
+# 只保留 request_max_retries / stream_max_retries / stream_idle_timeout_ms，
+# 其余键（supports_websockets / websocket_connect_timeout_ms）会被丢掉。
+# 所以这两个键写进数据库模板（直连模式下有效），但不拿来判定
+# 「config.toml 是否健康」——否则就是永远修不好、跟 CCS 互相覆盖。
+PROVIDER_TUNING_STRICT = [
+    ("stream_idle_timeout_ms", "300000"),
     ("request_max_retries", "8"),
     ("stream_max_retries", "8"),
 ]
@@ -105,13 +139,69 @@ def log(msg):
 
 
 def backup(path):
-    """改任何文件前先备份，命名带时间戳，可多重回滚"""
+    """改任何文件前先备份。
+
+       铁律：只有内容真的变了才备份。
+       原因（实测教训）：曾经每次 fix 都无条件备份，
+       结果 1 小时堆出 560 个 config.toml.bak-*，
+       磁盘被打满，而真正的改动可能一次都没发生。
+    """
     if not os.path.exists(path):
         return None
+    try:
+        with open(path, "rb") as f:
+            cur = f.read()
+    except Exception:
+        return None
+    # 与最近一份备份比内容：一样就说明这次没实质改动，不必再存一份
+    latest = _latest_backup(path)
+    if latest:
+        try:
+            with open(latest, "rb") as f:
+                if f.read() == cur:
+                    return None
+        except Exception:
+            pass
     os.makedirs(os.path.dirname(path), exist_ok=True)
     bak = "%s.bak-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
     shutil.copy2(path, bak)
+    _prune_backups(path)
     return bak
+
+
+def _latest_backup(path):
+    """列出该文件最新的备份（按 mtime 倒序）"""
+    d = os.path.dirname(path)
+    prefix = os.path.basename(path) + ".bak-"
+    try:
+        names = [os.path.join(d, n) for n in os.listdir(d)
+                 if n.startswith(prefix)]
+    except Exception:
+        return None
+    if not names:
+        return None
+    try:
+        names.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return names[0]
+    except Exception:
+        return names[0]
+
+
+def _prune_backups(path, keep=3):
+    """备份文件只留最近 keep 份——防止磁盘被备份撑爆"""
+    d = os.path.dirname(path)
+    prefix = os.path.basename(path) + ".bak-"
+    try:
+        names = [os.path.join(d, n) for n in os.listdir(d)
+                 if n.startswith(prefix)]
+        names.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    except Exception:
+        return
+    for old in names[keep:]:
+        try:
+            os.remove(old)
+        except Exception:
+            pass
 
 
 # ================================================================ 状态读取
@@ -132,6 +222,84 @@ def current_route():
             return json.load(f).get("apps", {}).get("codex", {}).get("proxy_route")
     except Exception:
         return None
+
+
+def _db_current_provider():
+    """只读：查数据库里 codex 当前选中的供应商 id（CC Switch 界面上打勾的那条）"""
+    if not os.path.exists(CC_DB):
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % CC_DB, uri=True, timeout=10)
+        row = con.execute(
+            "SELECT id FROM providers WHERE app_type='codex' AND is_current=1 LIMIT 1"
+        ).fetchone()
+        con.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _provider_name(provider_id):
+    """只读：查供应商名字（报错文案用）"""
+    if not provider_id or not os.path.exists(CC_DB):
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % CC_DB, uri=True, timeout=10)
+        row = con.execute(
+            "SELECT name FROM providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        con.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def fix_route_mismatch():
+    """治「界面显示的线路」和「实际转发的线路」不是同一条。
+
+       实测（2026-11-01 08:43）：
+       - CCS 数据库里 codex 的 is_current 已经是 PRO 线（86a24d5a）
+       - 但 ~/.cc-switch/live-state.json 里 codex.proxy_route 还是 Kiro 线（44856c30）
+       - CC Switch 代理转发时读的是 live-state.json，不是数据库
+       → 界面上你看着 PRO 线，代理实际全打到 Kiro 线。
+         Kiro 线只认 claude-*，Codex 一发就 503 / "not implemented"。
+
+       为什么两边会脱节：
+       CCS 切换路由时要同时写两个地方（数据库 + live-state.json），
+       任何一步失败/被打断（进程被杀、写库中途崩）就会留下一半。
+       本机实测就是 CCS 被重启时写了一半留下的。
+
+       怎么修：不重启 CCS，直接把 live-state.json 的 proxy_route
+       对齐到数据库的 is_current —— 实测改完立刻生效，
+       代理下一次请求就走新线路（CCS 每次请求都重读 live-state.json）。
+    """
+    if not os.path.exists(LIVE_STATE) or not os.path.exists(CC_DB):
+        return False
+    route = current_route()
+    db_route = _db_current_provider()
+    if not route or not db_route or route == db_route:
+        return False
+    try:
+        with open(LIVE_STATE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        codex = d.get("apps", {}).get("codex")
+        if not isinstance(codex, dict):
+            return False
+        codex["proxy_route"] = db_route
+        d["apps"]["codex"] = codex
+        bak = backup(LIVE_STATE)
+        with open(LIVE_STATE, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2, ensure_ascii=False)
+        FIX_LOG.append(
+            "CC Switch 实际转发的线路（%s）和界面上选的（%s）不是同一条——"
+            "代理读的是 live-state.json，两边脱节了。已把转发线路对齐到界面那一条"
+            "（不用重启 CC Switch，改完下一次请求就生效）"
+            % (_provider_name(route) or route[:8],
+               _provider_name(db_route) or db_route[:8]))
+        return True
+    except Exception as e:
+        say("  ⚠ 路由没对齐：%s" % e)
+        return False
 
 
 # ================================================================ 会话粘性提醒
@@ -193,16 +361,23 @@ def check_mode_switch():
                "旧会话可能粘住旧供应商配置。请点「新建会话」，不要复用旧会话。")
 
 
-def _ensure_provider_keys(seg_text):
+def _ensure_provider_keys(seg_text, strict=False):
     """给供应商小节补齐：WebSocket 快线开关 + 链路慢时的耐心值。
        只补缺失的，不覆盖已有配置——但如果耐心值比建议值小，
        慢链路下仍会被误判成断线，这种情况下要抬到建议值。
+
+       strict=True 时只补 CCS 接管重写后必然会保留的键
+       （stream_idle_timeout_ms / request_max_retries / stream_max_retries）——
+       用于改 config.toml。其余键只在写数据库模板时补
+       （用 strict=False），否则改完 config.toml 又被 CCS 覆盖，
+       形成「守护补 → CCS 覆盖」的自激循环。
        返回 (新段文本, 补了哪些)。"""
     added = []
-    if not re.search(r"^\s*supports_websockets\s*=", seg_text, re.M):
+    if not strict and not re.search(r"^\s*supports_websockets\s*=", seg_text, re.M):
         seg_text = seg_text.rstrip("\n") + "\nsupports_websockets = false\n"
         added.append("不走 WebSocket 快线")
-    for key, val in PROVIDER_TUNING:
+    tuning = PROVIDER_TUNING_STRICT if strict else PROVIDER_TUNING
+    for key, val in tuning:
         m = re.search(r"^\s*%s\s*=\s*(\d+)" % re.escape(key), seg_text, re.M)
         if not m:
             seg_text = seg_text.rstrip("\n") + "\n%s = %s\n" % (key, val)
@@ -305,39 +480,134 @@ def _cc_recent_failures(provider_id, window_sec=180):
         return 0, 0
 
 
-def _restart_cc_switch():
-    """重启 CC Switch —— 清空它攒下的坏连接池"""
-    pid = None
-    try:
-        r = subprocess.run(["lsof", "-nP", "-iTCP:15721", "-sTCP:LISTEN"],
-                           capture_output=True, text=True, timeout=15)
-        for line in (r.stdout or "").splitlines()[1:]:
-            parts = line.split()
-            if len(parts) > 1 and parts[1].isdigit():
-                pid = int(parts[1])
-                break
-    except Exception:
-        pid = None
-    if not pid:
+def _needs_user_agent(cfg):
+    """这个供应商的上游是不是在 Cloudflare 后面（需要真实 UA）
+
+       实测：只有 888aix 这类中转商域名会因缺 UA 被 CF 规则 1010 拦掉；
+       DeepSeek 官方、OpenCode 不带 UA 也正常返回。
+    """
+    m = re.search(r'base_url[ \t]*=[ \t]*"([^"]*)"', cfg or "")
+    if not m:
         return False
+    url = m.group(1).lower()
+    return "888aix" in url or url.endswith(".hitun.io")
+
+
+def _fix_provider_templates():
+    """把「链路慢时的耐心值」固化进 CC Switch 数据库里 provider 的 config 模板。
+
+       为什么必须改数据库而不是只改 config.toml：
+       CC Switch 接管代理时会用它自己的模板重写 config.toml，
+       只在 config.toml 里补的键下一次就被冲掉。
+       守护反复补 → CCS 反复覆盖 → 自激循环
+       （实测：1 小时堆出 560 个 config.toml.bak-*，CCS 每几秒被重启一次）。
+
+       实测结论：数据库模板里这些官方 Codex 键能被 CCS 保留
+       （request_max_retries / stream_max_retries / stream_idle_timeout_ms
+         / supports_websockets / websocket_connect_timeout_ms），
+       不认识的键（如 zzz_custom_probe）会被丢弃——所以只写官方键。
+    """
+    if not os.path.exists(CC_DB):
+        return
     try:
-        subprocess.run(["kill", str(pid)], capture_output=True, timeout=15)
-        time.sleep(5)
-        subprocess.run(["open", "-a", "CC Switch"], capture_output=True, timeout=20)
-        time.sleep(8)
-        return True
-    except Exception:
-        return False
+        con = sqlite3.connect(CC_DB, timeout=20)
+        cur = con.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        rows = cur.execute(
+            "SELECT id, name, settings_config FROM providers WHERE app_type='codex'"
+        ).fetchall()
+        changed = 0
+        for pid, pname, sc in rows:
+            if not sc:
+                continue
+            # 官方直连的 provider 不碰——它没有第三方上游，加这些键没有意义
+            if (pname or "").strip().lower() in ("openai official", "openai official 官方"):
+                continue
+            if (pid or "").startswith("codex-official"):
+                continue
+            try:
+                d = json.loads(sc)
+            except Exception:
+                continue
+            cfg = d.get("config") or ""
+            # 模板里 [model_providers.custom] 后面缺换行会让 TOML 解析异常
+            if "[model_providers.custom]name" in cfg:
+                cfg = cfg.replace("[model_providers.custom]name",
+                                  "[model_providers.custom]\nname")
+                d["config"] = cfg
+                cur.execute("UPDATE providers SET settings_config=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), pid))
+                changed += 1
+                FIX_LOG.append("修好供应商模板里 [model_providers.custom] 后面漏掉的换行"
+                               "（%s）——不然 TOML 解析会出错" % pname)
+            # 缺 User-Agent 会被 Cloudflare 规则 1010 拦掉（浏览器完整性检查）
+            # ——实测：无 UA 时上游返回 403「used Cloudflare to restrict access」，
+            #    带上 codex_cli_rs 的 UA 后同样的请求 HTTP 200。
+            # 必须放在 meta.customUserAgent（放 settings_config 顶层不生效）。
+            # 只对走 Cloudflare 的中转商域名加 —— 实测 DeepSeek/OpenCode
+            # 不带 UA 也正常，乱加没有意义。
+            if _needs_user_agent(cfg):
+                meta = d.get("meta")
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = None
+                if not isinstance(meta, dict):
+                    meta = {}
+                if not meta.get("customUserAgent"):
+                    meta["customUserAgent"] = CODEX_UA
+                    d["meta"] = meta
+                    cur.execute("UPDATE providers SET settings_config=? WHERE id=?",
+                                (json.dumps(d, ensure_ascii=False), pid))
+                    changed += 1
+                    FIX_LOG.append("给供应商（%s）补上 User-Agent（%s）——"
+                                   "缺 UA 会被 Cloudflare 规则 1010 拦掉，"
+                                   "表现成「连不上/一直重连」"
+                                   % (pname or pid[:8], CODEX_UA))
+            if "[model_providers.custom]" not in cfg:
+                continue
+            seg_m = re.search(r"\[model_providers\.custom\](.*)$", cfg, re.S)
+            if not seg_m:
+                continue
+            seg = seg_m.group(1)
+            new_seg, added = _ensure_provider_keys(seg)
+            if not added:
+                continue
+            # 注意：cfg 可能是上面修过换行的版本，必须基于 cfg 拼接。
+            # 关键：段标题和内容之间必须保留一个换行 ——
+            # seg_m.start(1) 正好是段标题之后的位置，
+            # 所以这里补一个 "\n"，再把段体首尾的换行去掉，
+            # 否则 [model_providers.custom] 和 name 会黏成一行，TOML 解析出错。
+            new_cfg = (cfg[:seg_m.start(1)] + "\n"
+                       + new_seg.strip("\n") + "\n")
+            d["config"] = new_cfg
+            cur.execute("UPDATE providers SET settings_config=? WHERE id=?",
+                        (json.dumps(d, ensure_ascii=False), pid))
+            changed += 1
+            FIX_LOG.append("把耐心值固化进 CCS 数据库模板（%s）：%s"
+                           % (pname or pid[:8], "、".join(added)))
+        if changed:
+            con.commit()
+        con.close()
+    except Exception as e:
+        say("  ⚠ 数据库模板暂时写不进去：%s" % e)
 
 
 def fix_connection_pool():
-    """治「连接池里攒了坏连接」。
+    """处理「连接池里攒了坏连接」。
 
        实测：中转商会静默掐断空闲的 keep-alive 连接（不发 FIN/RST），
        客户端连接池里那条连接就成了「僵尸」——下次复用直接报
        connection closed via error / handshake timed out。
-       CC Switch 复用连接，于是越用越死（实测连败 88 次）。
-       解法只有一个：重启 CC Switch 让它丢掉这些连接。
+
+       用户要求（2026-11-01）：**不自动重启 CC Switch**。
+       重启会当场打断用户正在跑的 Codex 会话，
+       而且源站劣化时守护会反复重启（实测 1 小时堆出 560 个备份、
+       CCS 被重启十几次）——弊远大于利。
+       现在只做两件不动手的事：
+         1) 重置熔断计数（让 CCS 别继续拉闸）
+         2) 在体检报告里给出提示，由用户自己决定要不要重启
     """
     route = current_route()
     if not route:
@@ -348,20 +618,23 @@ def fix_connection_pool():
     # 连续失败但又夹杂成功 → 不是池子坏了，是链路抖（重试能救）
     if fails < total:
         return
-    # 熔断计数也一起清掉
+    # 熔断计数重置（只改计数，不重启进程）
+    reset = False
     try:
         con = sqlite3.connect(CC_DB, timeout=20)
         cur = con.cursor()
         cur.execute("UPDATE provider_health SET consecutive_failures=0, "
                     "is_healthy=1, last_error=NULL "
                     "WHERE provider_id=? AND app_type='codex'", (route,))
+        reset = cur.rowcount > 0
         con.commit()
         con.close()
     except Exception:
         pass
-    if _restart_cc_switch():
-        FIX_LOG.append("连续 %d 次连接失败——重启了 CC Switch 清掉坏连接池，"
-                       "并重置了熔断计数（中转商掐断 keep-alive 连接所致）" % fails)
+    if reset:
+        FIX_LOG.append("连续 %d 次连接失败——已重置熔断计数（不重启 CC Switch）。"
+                       "若仍不通，手动重启一次 CC Switch 即可清掉坏连接池"
+                       "（中转商掐断 keep-alive 连接所致）" % fails)
 
 
 def _system_bypass_has(domain):
@@ -380,6 +653,101 @@ def _system_bypass_has(domain):
         return False
     except Exception:
         return True   # 查不到就不误报
+
+
+def _clash_controller():
+    """找一个能用的 Clash 外部控制器。
+
+       返回 (base_url, secret) 或 None。
+       ⚠️ 端口和 secret 都会变：本机实测配置文件里写 9090/hitun，
+       但运行中的内核实际监听 4788（secret 空）——
+       它加载的是订阅合并后的另一份配置，不是磁盘上那份。
+       所以这里逐个探测，不写死。
+    """
+    import urllib.request
+    import urllib.error
+    for host, port, secret in CLASH_CONTROLLERS:
+        base = "http://%s:%d" % (host, port)
+        for sk in ([secret] if secret else ["", "hitun"]):
+            try:
+                req = urllib.request.Request(base + "/version")
+                if sk:
+                    req.add_header("Authorization", "Bearer " + sk)
+                urllib.request.urlopen(req, timeout=4).read()
+                return base, sk
+            except Exception:
+                continue
+    return None, None
+
+
+def _clash_runtime_has_rule(domain):
+    """只读：Clash 内核运行时规则表里有没有这条域名规则。
+
+       这是本轮最关键的一个判据——**文件里有规则 ≠ 内核加载了规则**。
+       实测：守护把 DIRECT 规则写进 rocket.yaml 了，
+       但内核运行时 678 条规则里「888aix」出现 0 次 → 规则根本没进去。
+    """
+    base, secret = _clash_controller()
+    if not base:
+        return None      # 连不上控制器，判断不了
+    import urllib.request
+    try:
+        req = urllib.request.Request(base + "/rules")
+        if secret:
+            req.add_header("Authorization", "Bearer " + secret)
+        d = json.loads(urllib.request.urlopen(req, timeout=6).read().decode())
+        for r in (d.get("rules") or []):
+            p = str(r.get("payload") or "")
+            if domain in p and str(r.get("proxy")) == "DIRECT":
+                return True
+        return False
+    except Exception:
+        return None
+
+
+def _clash_reload_if_needed():
+    """让 Clash 内核真正吃进配置里的 AIX 直连规则。
+
+       为什么必须这么做（2026-11-01 实测）：
+       Clash 只在启动时加载配置，改完 rocket.yaml 不会自动生效。
+       守护在 08:01 就把 DIRECT 规则写进文件了，但内核运行时规则表里
+       678 条规则中「888aix」出现 0 次 —— 规则没进去。
+       后果：CC Switch 走系统代理 → 走 Clash 4780 → 落到兜底 MATCH,Others
+       → 走境外节点 → **经 Clash 请求 0/6 全败（SSL EOF），直连 5/6 正常**。
+
+       修法：PUT /configs?force=true 热重载，再读 /rules 校验。
+       ⚠️ 不重启 Clash 内核 —— 那会断掉所有人的代理。
+    """
+    base, secret = _clash_controller()
+    if not base:
+        return False
+    # 先看运行时有没有；有就不用动
+    has = _clash_runtime_has_rule("api.888aix.cn")
+    if has is True:
+        return False
+    import urllib.request
+    import urllib.error
+    try:
+        data = json.dumps({"path": CLASH_CONFIG}).encode()
+        req = urllib.request.Request(
+            base + "/configs?force=true", data=data,
+            headers={"Content-Type": "application/json"}, method="PUT")
+        if secret:
+            req.add_header("Authorization", "Bearer " + secret)
+        urllib.request.urlopen(req, timeout=20).read()
+    except Exception as e:
+        say("  ⚠ Clash 配置热重载失败：%s" % e)
+        return False
+    # 校验：规则到底进没进去
+    has2 = _clash_runtime_has_rule("api.888aix.cn")
+    if has2 is True:
+        FIX_LOG.append("Clash 内核已热重载，AIX 直连规则真正生效——"
+                       "（之前只改了文件没重载，内核里的 678 条规则一条 888aix 都没有，"
+                       "导致 CC Switch 走 Clash 时全部失败）")
+        return True
+    FIX_LOG.append("Clash 配置已重载，但运行时规则表里仍找不到 AIX 直连规则——"
+                   "CC Switch 走 Clash 可能仍会失败，建议检查 Clash 客户端")
+    return False
 
 
 def _provider_custom_segment(provider_id):
@@ -512,18 +880,17 @@ def doctor(verbose=True):
             span = _segment_span(src, "model_providers.custom")
             if span:
                 seg = src[span[0]:span[1]]
-                if not re.search(r"^\s*supports_websockets\s*=\s*false", seg, re.M):
-                    ISSUES.append(("ws-flag",
-                                   "新版 Codex 默认用「WebSocket 快线」送请求，"
-                                   "但 CC Switch 只收「HTTP 普通件」——"
-                                   "需要在供应商小节加一行 supports_websockets = false", "fix"))
+                # 不在这里检查 supports_websockets。
+                # 实测：CC Switch 接管时会用它自己的字段集重写 config.toml，
+                # 这个键必然被丢掉 → 守护补 → CCS 再覆盖 → 自激循环。
+                # 它已经写进数据库模板里（直连模式有效），接管模式下由 CCS 自己处理。
             else:
                 ISSUES.append(("custom-seg-missing",
                                "菜单里缺少 [model_providers.custom] 小节", "fix"))
             # 链路慢时的耐心值：没有它，Codex 会把"上游慢"误判成"断了"
             # 太小的同样不行——AIX 首字节实测就要 2–8 秒
             too_small = []
-            for k, v in PROVIDER_TUNING:
+            for k, v in PROVIDER_TUNING_STRICT:
                 mv = re.search(r"^\s*%s\s*=\s*(\d+)" % re.escape(k), seg, re.M)
                 if not mv:
                     too_small.append("%s（缺）" % k)
@@ -557,6 +924,113 @@ def doctor(verbose=True):
                            "「第三方路由」的写法——Codex 会把请求错送到 CC Switch 那里，"
                            "被退回 401", "fix"))
 
+    # ---- 检查 Clash 规则（AIX 必须直连）----
+    if os.path.exists(CLASH_CONFIG):
+        try:
+            with open(CLASH_CONFIG, "r", encoding="utf-8") as f:
+                y = f.read()
+            if "888aix.cn,DIRECT" not in y:
+                ISSUES.append(("clash-direct-rule-missing",
+                               "Clash 的规则里没有 api.888aix.cn → DIRECT——"
+                               "订阅更新把它冲掉了，这个域名会落到兜底规则"
+                               "MATCH,Others 走境外节点，实测 TLS 握手失败、"
+                               "表现成「连不上」", "fix"))
+        except Exception:
+            pass
+
+    # ---- 检查数据库模板里有没有耐心值（治本项）----
+    # 只改 config.toml 是不够的：CCS 接管时会用自己的模板重写 config.toml，
+    # 把补进去的键冲掉，守护与 CCS 互相覆盖形成自激循环。
+    if mode == "proxy" and os.path.exists(CC_DB):
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % CC_DB, uri=True, timeout=10)
+            rows = con.execute(
+                "SELECT id, name, settings_config FROM providers "
+                "WHERE app_type='codex'"
+            ).fetchall()
+            con.close()
+            miss = []
+            for pid, pname, sc in rows:
+                if not sc:
+                    continue
+                # 官方直连不适用（没有第三方上游）——与 fix 的口径保持一致
+                if (pid or "").startswith("codex-official"):
+                    continue
+                if (pname or "").strip().lower() == "openai official":
+                    continue
+                try:
+                    cfg = json.loads(sc).get("config") or ""
+                except Exception:
+                    continue
+                if "[model_providers.custom]" not in cfg:
+                    continue
+                seg_m = re.search(r"\[model_providers\.custom\](.*)$", cfg, re.S)
+                if not seg_m:
+                    continue
+                seg = seg_m.group(1)
+                for k, v in PROVIDER_TUNING_STRICT:
+                    mv = re.search(r"^\s*%s\s*=\s*(\d+)" % re.escape(k), seg, re.M)
+                    if not mv or int(mv.group(1)) < int(v):
+                        miss.append("%s: %s" % (pid[:8], k))
+                        break
+            if miss:
+                ISSUES.append(("template-tuning-missing",
+                               "CC Switch 数据库里的供应商模板缺耐心值（%s）——"
+                               "CCS 接管时会用它自己的模板重写 config.toml，"
+                               "只在菜单里补的键会被冲掉，"
+                               "于是「守护补 → CCS 覆盖」来回打架"
+                               % "、".join(miss[:4]), "fix"))
+
+            # ---- 检查供应商有没有带 User-Agent（CF 规则 1010）----
+            no_ua = []
+            for pid, pname, sc in rows:
+                if not sc:
+                    continue
+                if (pid or "").startswith("codex-official"):
+                    continue
+                if (pname or "").strip().lower() == "openai official":
+                    continue
+                try:
+                    d = json.loads(sc)
+                except Exception:
+                    continue
+                if not _needs_user_agent(d.get("config") or ""):
+                    continue
+                meta = d.get("meta")
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = None
+                if not isinstance(meta, dict):
+                    meta = {}
+                if not meta.get("customUserAgent"):
+                    no_ua.append(pname or pid[:8])
+            if no_ua:
+                ISSUES.append(("missing-user-agent",
+                               "供应商（%s）没有设 User-Agent——"
+                               "上游在 Cloudflare 后面，不带 UA 会被规则 1010"
+                               "（浏览器完整性检查）拦掉，返回 403 "
+                               "「used Cloudflare to restrict access」，"
+                               "表现就是「连不上/一直重连」"
+                               % "、".join(no_ua[:4]), "fix"))
+        except Exception:
+            pass
+
+    # ---- 备份文件堆积 ----
+    try:
+        d = os.path.dirname(CONFIG)
+        prefix = os.path.basename(CONFIG) + ".bak-"
+        nb = len([n for n in os.listdir(d) if n.startswith(prefix)])
+        if nb > 8:
+            ISSUES.append(("backup-pileup",
+                           "config.toml 的备份堆了 %d 份——"
+                           "守护反复在改同一个文件（每次都备份），"
+                           "说明修复没真正落地，或者在跟别的程序互相覆盖",
+                           "fix"))
+    except Exception:
+        pass
+
         if "/Applications/Codex.app" in src and detect_client_root():
             ISSUES.append(("dead-path",
                            "菜单里还写着老版本客户端的地址（/Applications/Codex.app），"
@@ -572,13 +1046,26 @@ def doctor(verbose=True):
     # ---- 检查连接池坏连接（中转商掐断 keep-alive 所致）----
     route = current_route()
     if mode == "proxy" and route:
+        # ---- 检查「界面选的线路」和「实际转发的线路」是不是同一条 ----
+        db_route = _db_current_provider()
+        if db_route and db_route != route:
+            ISSUES.append(("route-mismatch",
+                           "CC Switch 实际转发的线路（%s）和界面上选的（%s）不是同一条"
+                           "——代理读的是 live-state.json，两边脱节了。"
+                           "你看着是 PRO 线，请求其实全打到另一条线，"
+                           "报错会跟界面显示的对不上"
+                           % (_provider_name(route) or route[:8],
+                              _provider_name(db_route) or db_route[:8]), "fix"))
         fails, total = _cc_recent_failures(route)
         if total >= 5 and fails >= 5 and fails == total:
             ISSUES.append(("stale-connection-pool",
                            "当前线路连续 %d 次连接失败（全是 connection closed / "
                            "handshake timed out）——中转商把空闲的 keep-alive 连接"
                            "悄悄掐断了，CC Switch 连接池里攒下坏连接，越用越死。"
-                           "重启 CC Switch 可清掉" % fails, "fix"))
+                           "守护已自动重置熔断计数；"
+                           "若仍不通，手动重启一次 CC Switch 即可清掉"
+                           "（守护不会自动重启，免得打断你正在跑的会话）"
+                           % fails, "fix"))
 
     # ---- 检查模型目录（Codex 读它拿模型元数据）----
     if mode == "proxy" and route and os.path.exists(CATALOG_FILE):
@@ -608,6 +1095,28 @@ def doctor(verbose=True):
                                    % "、".join(badtool), "fix"))
             except Exception:
                 pass
+
+    # ---- 检查 Clash 运行时规则（文件里有 ≠ 内核加载了）----
+    if os.path.exists(CLASH_CONFIG):
+        try:
+            with open(CLASH_CONFIG, "r", encoding="utf-8") as f:
+                y = f.read()
+            if "888aix.cn,DIRECT" not in y:
+                ISSUES.append(("clash-config-rule-missing",
+                               "Clash 配置文件里没有 AIX 的直连规则——"
+                               "CC Switch 走系统代理时会落到兜底规则走境外节点，"
+                               "上游连接会被掐", "fix"))
+            else:
+                # 文件里有，但内核不一定加载了 —— 必须查运行时规则表
+                has = _clash_runtime_has_rule("api.888aix.cn")
+                if has is False:
+                    ISSUES.append(("clash-rule-not-loaded",
+                                   "Clash 配置文件里有 AIX 直连规则，但内核运行时规则表里没有"
+                                   "——规则改完没重新加载，等于没加。"
+                                   "CC Switch 走 Clash 时会全部失败（实测 0/6 全败、"
+                                   "直连 5/6 正常）", "fix"))
+        except Exception:
+            pass
 
     # ---- 检查 .env ----
     if os.path.exists(ENV_FILE):
@@ -775,6 +1284,12 @@ def fix():
     mode = current_mode()
     client_root = detect_client_root()
 
+    # ---------- 0. 路由对齐（必须最先做）----------
+    # 代理转发读的是 live-state.json，不是数据库。
+    # 两边脱节时，界面显示的线路 ≠ 实际打的线路，
+    # 后面按 current_route() 做的所有修正都会改错对象。
+    fix_route_mismatch()
+
     # ---------- 1. config.toml ----------
     if os.path.exists(CONFIG):
         bak = backup(CONFIG)
@@ -831,7 +1346,7 @@ def fix():
             span = _segment_span(src, "model_providers.custom")
             if span:
                 s, e = span
-                seg, added = _ensure_provider_keys(src[s:e])
+                seg, added = _ensure_provider_keys(src[s:e], strict=True)
                 if added:
                     src = src[:s] + seg + src[e:]
                     FIX_LOG.append("供应商小节补齐：%s" % "、".join(added))
@@ -839,7 +1354,7 @@ def fix():
                 # 段整段缺失（比如被清理过）：照搬 CC Switch 里当前路由的段原文
                 seg_text = _provider_custom_segment(current_route())
                 if seg_text:
-                    seg_text, added = _ensure_provider_keys(seg_text)
+                    seg_text, added = _ensure_provider_keys(seg_text, strict=True)
                     src = src.rstrip("\n") + "\n\n" + seg_text
                     FIX_LOG.append("菜单里缺少 [model_providers.custom] 小节——"
                                    "已按当前路由的供应商配置补建（照搬，不编造），"
@@ -967,6 +1482,47 @@ def fix():
                            % "、".join(MUST_BYPASS_DOMAINS))
         except Exception as e:
             say("  ⚠ 系统代理绕过列表暂时改不了（不影响 Codex 走本地代理）：%s" % e)
+
+    # ---------- 2.6 Clash 规则置顶直连 + 内核热重载 ----------
+    # 订阅更新会重生成 rocket.yaml，手工加的 DIRECT 规则会被冲掉。
+    #
+    # ⚠️ 关键教训（2026-11-01 实测）：**光改文件不管用**。
+    # Clash 内核加载配置是在启动时做的，改完 rocket.yaml 不会自动生效——
+    # 实测守护在 08:01 把 DIRECT 规则写进文件了，但内核运行时规则表里
+    # 678 条规则中「888aix」出现 0 次，规则根本没进去。
+    # 结果：CC Switch 走系统代理 → 走 Clash 4780 → 落到 MATCH,Others
+    # → 走境外节点 → 经 Clash 请求 0/6 全败（SSL EOF），直连 5/6 正常。
+    #
+    # 正解：改完文件后用 Clash 的外部控制器热重载（PUT /configs?force=true），
+    # 再读 /rules 校验运行时规则表里确实有这条规则。
+    try:
+        if os.path.exists(CLASH_CONFIG):
+            with open(CLASH_CONFIG, "r", encoding="utf-8") as f:
+                y = f.read()
+            if "888aix.cn,DIRECT" not in y:
+                y2 = y.replace(
+                    "rules:\n",
+                    "rules:\n  # AIX 中转（Codex 唯一供应商）——强制直连，"
+                    "避免落到 MATCH,Others 走境外节点\n"
+                    "  - DOMAIN,api.888aix.cn,DIRECT\n"
+                    "  - DOMAIN-SUFFIX,888aix.cn,DIRECT\n", 1)
+                if y2 != y:
+                    with open(CLASH_CONFIG, "w", encoding="utf-8") as f:
+                        f.write(y2)
+                    FIX_LOG.append("Clash 规则补上 api.888aix.cn → DIRECT——"
+                                   "订阅更新把它冲掉了，落到兜底规则就走境外节点")
+            # 文件里有规则 ≠ 内核加载了。必须核对运行时规则表。
+            _clash_reload_if_needed()
+    except Exception as e:
+        say("  ⚠ Clash 规则暂时改不了：%s" % e)
+
+    # ---------- 2.7 CCS 数据库模板固化（真正的治本）----------
+    # 关键教训：CC Switch 接管时会用它自己的模板重写 config.toml，
+    # 我们在 config.toml 里补的键会被覆盖掉 → 守护与 CCS 互相覆盖，
+    # 形成自激循环（实测 1 小时堆出 560 个备份、CCS 被反复重启）。
+    # 正解是把耐心值键写进数据库里 provider 的 config 模板，
+    # 这样 CCS 每次重写 config.toml 时都会带上它们。
+    _fix_provider_templates()
 
     # ---------- 3. CC Switch 模板库（治本）----------
     if os.path.exists(CC_DB):
@@ -1105,8 +1661,22 @@ exit 0
 
 WATCH_LOOP = '''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""watch_loop.py — 轮询兜底：每 3 秒查一次，菜单被写坏就修（秒级交给 FSEvents）"""
-import os, subprocess, sys, time
+"""watch_loop.py — 轮询兜底：菜单被写坏就修（秒级交给 FSEvents）
+
+铁律（实测教训）：
+1) 只在「内容真的变了」时才修 —— 用内容指纹，不用 mtime+size。
+   CCS 一直在写 cc-switch.db（熔断计数、请求日志），mtime 天天在变，
+   但内容没实质变化，不该每次都跑一遍 fix。
+2) 自己写的文件不触发自己 —— 否则 fix 写库 → 触发 fix → 无限循环。
+   实测曾 1 小时堆出 560 个 config.toml.bak-*，CCS 每几秒被重启一次。
+   所以每次 fix 之后重取快照，只有「快照之后又变了」才再修。
+3) 最小间隔 —— 两次修复之间至少隔 20 秒，别把磁盘写满。
+"""
+import hashlib
+import os
+import subprocess
+import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PIDFILE = os.path.join(HERE, "watcher.pid")
@@ -1116,15 +1686,24 @@ TARGETS = [os.path.join(os.path.expanduser("~"), ".codex", "config.toml"),
            os.path.join(os.path.expanduser("~"), ".codex", ".env"),
            os.path.join(os.path.expanduser("~"), ".cc-switch", "cc-switch.db")]
 
+MIN_INTERVAL = 20   # 秒：两次 fix 之间的最小间隔
+
+
+def digest(path):
+    """算文件内容指纹；读不到就返回 None"""
+    try:
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 def snap():
-    d = {}
-    for p in TARGETS:
-        try:
-            st = os.stat(p)
-            d[p] = (st.st_mtime, st.st_size)
-        except OSError:
-            d[p] = None
-    return d
+    return {p: digest(p) for p in TARGETS}
+
 
 try:
     with open(PIDFILE, "w") as f:
@@ -1132,7 +1711,8 @@ try:
 except Exception:
     pass
 
-prev = {}   # 首轮必须初始化，否则第一次比较就 NameError 崩掉
+prev = snap()      # 首轮先记快照，别一上来就修
+last_fix = 0.0
 
 while True:
     time.sleep(3)
@@ -1140,11 +1720,12 @@ while True:
         cur = snap()
     except Exception:
         continue
-    changed = any(prev.get(p) is not None and prev.get(p) != v
-                  for p, v in cur.items())
-    if changed:
-        time.sleep(0.4)  # 等写完落盘
-        subprocess.run([PY, GUARD, "fix"], capture_output=True, timeout=120)
+    changed = [p for p in TARGETS
+               if prev.get(p) is not None and prev.get(p) != cur.get(p)]
+    if changed and (time.time() - last_fix) >= MIN_INTERVAL:
+        time.sleep(0.4)   # 等写完落盘
+        last_fix = time.time()
+        subprocess.run([PY, GUARD, "fix"], capture_output=True, timeout=180)
         cur = snap()
     prev = cur
 '''
@@ -1193,7 +1774,7 @@ let pidURL = URL(fileURLWithPath: "\\(home)/.codex/leo-guard/fsevents.pid")
 
 func log(_ m: String) {
     let ts = ISO8601DateFormatter().string(from: Date())
-    let line = "[\\(ts)] \\(m)\\n"
+    let line = "[\\(ts)] \\(m)\n"
     if let fh = try? FileHandle(forWritingTo: logURL) {
         defer { try? fh.close() }
         fh.seekToEndOfFile()
@@ -1204,9 +1785,13 @@ func log(_ m: String) {
 }
 
 var lastRun = Date.distantPast
+// 最小间隔 20 秒（实测教训：0.5 秒太密，fix 写库 → 触发 fix →
+// 1 小时堆出 560 个 config.toml.bak-*，CCS 每几秒被重启一次）
+let MIN_INTERVAL: TimeInterval = 20
+
 func runFix() {
     let now = Date()
-    if now.timeIntervalSince(lastRun) < 0.5 { return }
+    if now.timeIntervalSince(lastRun) < MIN_INTERVAL { return }
     lastRun = now
     let p = Process()
     p.executableURL = URL(fileURLWithPath: pyRun)
